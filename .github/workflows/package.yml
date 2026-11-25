@@ -1,0 +1,388 @@
+name: Package desktop app
+
+# Builds the desktop app for Windows, Linux and macOS and launch-checks each one. The built
+# installers (and, when the signing key secret is set, their update signatures) are kept in a
+# DRAFT release named build-v<version> in the repository the workflow runs in: never published,
+# never tagged. scripts/publish-release.mjs publishes them and deletes the draft.
+#
+# Where it runs. This same file is used in two places:
+#   - Lance4Life/household-planner-releases (public), the usual place since 2026-11-24: Actions
+#     minutes are free for public repositories. It checks out the private source with a
+#     read-only deploy key (secret SOURCE_DEPLOY_KEY) and is started by hand:
+#       gh workflow run package.yml --repo Lance4Life/household-planner-releases \
+#         -f source_ref=<branch or commit>            (all three platforms; -f platforms=linux for one)
+#     scripts/sync-release-workflows.sh copies this file there after any change.
+#   - Lance4Life/financial-planner (private), by pushing to packaging/<anything> (paid minutes;
+#     macOS counts tenfold). packaging/windows-*, packaging/linux-*, packaging/macos-* build one
+#     platform. No caches are used in the public repository, so nothing built from the private
+#     source is left where a pull request from a fork could read it.
+on:
+  push:
+    branches: ['packaging/**']
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Branch or commit of Lance4Life/financial-planner to build (used in the public releases repo)
+        default: main
+      platforms:
+        description: Which platforms to build
+        type: choice
+        options: [all, linux, windows, macos]
+        default: all
+
+env:
+  SOURCE_REPO: Lance4Life/financial-planner
+  # In the private repository the pushed commit is built; elsewhere, the source_ref input.
+  IN_SOURCE_REPO: ${{ github.repository == 'Lance4Life/financial-planner' }}
+
+permissions:
+  contents: write # to keep the build files in a draft release; nothing is published or tagged
+
+jobs:
+  # Picks the platforms to build. A branch named packaging/windows-*, packaging/linux-* or
+  # packaging/macos-* builds only that platform (useful when chasing one platform's failure);
+  # anything else builds all three.
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.pick.outputs.matrix }}
+      draft: ${{ steps.draft.outputs.tag }}
+      source_sha: ${{ steps.draft.outputs.source_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ github.repository == 'Lance4Life/financial-planner' && github.sha || inputs.source_ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+
+      # One draft release per version, created here (before the platform jobs) so the three jobs
+      # never race to create it. A rebuild of the same version re-points it at the new commit; each
+      # platform's files are replaced as that platform finishes.
+      - id: draft
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version=$(node -p "require('./package.json').version")
+          source_sha=$(git rev-parse HEAD)
+          tag="build-v$version"
+          notes="Build files for $version from $SOURCE_REPO commit $source_sha. Staging only, never published from here: scripts/publish-release.mjs publishes them and deletes this draft."
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft --target "$GITHUB_SHA" --notes "$notes"
+          else
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --draft --target "$GITHUB_SHA" --title "Build $version (not published)" --notes "$notes"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
+
+      - id: pick
+        shell: bash
+        run: |
+          linux='{"os":"ubuntu-latest","name":"linux"}'
+          windows='{"os":"windows-latest","name":"windows"}'
+          macos='{"os":"macos-latest","name":"macos"}'
+          ref="$GITHUB_REF_NAME"
+          [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] && ref="packaging/${{ inputs.platforms }}"
+          case "$ref" in
+            packaging/windows*) list="$windows" ;;
+            packaging/linux*) list="$linux" ;;
+            packaging/macos*) list="$macos" ;;
+            *) list="$linux,$windows,$macos" ;;
+          esac
+          echo "matrix={\"include\":[$list]}" >> "$GITHUB_OUTPUT"
+
+  package:
+    needs: plan
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      # Every platform builds the one commit the plan job resolved.
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.plan.outputs.source_sha }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: ${{ env.IN_SOURCE_REPO == 'true' && 'npm' || '' }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        if: env.IN_SOURCE_REPO == 'true'
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install Linux webview build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev libsoup-3.0-dev \
+            libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev \
+            patchelf file xvfb lsof
+
+      - run: npm ci
+
+      - run: npm run build
+
+      - name: Prepare the local-server sidecar
+        run: npm run package:prepare-sidecar
+
+      - name: Package-smoke the shipped server bundle (headless)
+        shell: bash
+        run: |
+          set -euo pipefail
+          sidecar=$(ls src-tauri/binaries/planner-server-* | head -1)
+          node scripts/package-smoke.mjs --node "$sidecar" --server dist/server/main.js
+
+      # Updates are signed with the key in the repository secrets. Without it (a fork, or
+      # before the owner has run scripts/setup-releases.sh) the app is still built and
+      # launch-checked, just without update files: tauri.no-updates.conf.json turns them off.
+      # The override is passed as an absolute path, because a JSON string would not survive
+      # npm's command-line quoting on Windows.
+      - name: Build the desktop package
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          case "${{ runner.os }}" in
+            Linux) bundles=deb,appimage ;;
+            Windows) bundles=nsis ;;
+            macOS) bundles=dmg,app ;;
+          esac
+          if [ -n "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo "Signed build: update files will be produced."
+            npm run tauri -- build --bundles "$bundles"
+          else
+            echo "::warning::No TAURI_SIGNING_PRIVATE_KEY secret, so this build has no update files. Run scripts/setup-releases.sh once."
+            override=$(node -p "require('node:path').resolve('src-tauri/tauri.no-updates.conf.json')")
+            npm run tauri -- build --bundles "$bundles" --config "$override"
+          fi
+
+      # First launch, offline core load, and (Linux/macOS) that closing the app
+      # stops the local server sidecar — using the real signal Task Manager/Force
+      # Quit-style termination and a session logout both send, exercising the
+      # Unix cleanup path in src-tauri/src/lib.rs. Windows only gets an equivalent
+      # for the *normal* quit path (clicking the window's close box), which this
+      # non-interactive check cannot simulate; see docs/PACKAGING.md.
+      - name: Launch check (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            # The raw target/release/financial-planner-desktop has no resources or
+            # sidecar next to it — Tauri only copies those into the bundle output
+            # (target/release/bundle/...) during bundling. Install the real .deb,
+            # exactly like a user would, so resource_dir() resolves the same way.
+            sudo dpkg -i "src-tauri/target/release/bundle/deb/"*.deb
+            app_bin="/usr/bin/financial-planner-desktop"
+            # Start Xvfb ourselves (instead of the xvfb-run wrapper script) so the
+            # app is the direct child we launch, not a grandchild behind a shell
+            # wrapper — otherwise `$!` below would name the wrapper, and signalling
+            # it would not reliably reach the app or its sidecar.
+            Xvfb :99 -screen 0 1280x1024x24 > /dev/null 2>&1 &
+            export DISPLAY=:99
+            sleep 1
+          else
+            app_dir=$(ls -d "src-tauri/target/release/bundle/macos/"*.app | head -1)
+            app_bin="$app_dir/Contents/MacOS/financial-planner-desktop"
+          fi
+
+          test_home=$(mktemp -d)
+          mkdir -p "$test_home/.local/share" "$test_home/Library/Application Support"
+          # NO_AT_BRIDGE=1: without a session D-Bus (typical on a CI runner), GTK's
+          # accessibility bridge otherwise warns/stalls trying to reach org.a11y.Bus.
+          # LIBGL_ALWAYS_SOFTWARE / WEBKIT_DISABLE_COMPOSITING_MODE: headless CI
+          # runners often have no usable GPU under Xvfb; forcing software rendering
+          # avoids WebKitGTK hanging during its first paint. None of this affects a
+          # real user's machine, which has a real display and GPU.
+          HOME="$test_home" NO_AT_BRIDGE=1 LIBGL_ALWAYS_SOFTWARE=1 WEBKIT_DISABLE_COMPOSITING_MODE=1 \
+            "$app_bin" > "$test_home/app.log" 2>&1 &
+          app_pid=$!
+
+          sidecar_pid=""
+          for i in $(seq 1 90); do
+            sidecar_pid=$(pgrep -f "planner-server.*main\.js" | head -1 || true)
+            [ -n "$sidecar_pid" ] && break
+            sleep 1
+          done
+          if [ -z "$sidecar_pid" ]; then
+            echo "The packaged app did not start its local server sidecar within 90s."
+            echo "--- app.log ---"
+            cat "$test_home/app.log" || true
+            echo "--- process tree ---"
+            ps -ef | grep -E "financial-planner-desktop|planner-server" | grep -v grep || true
+            exit 1
+          fi
+          echo "Sidecar found after ${i}s."
+
+          port=""
+          for _ in $(seq 1 30); do
+            port=$(lsof -a -p "$sidecar_pid" -i -P -n 2>/dev/null | grep LISTEN | grep -oE '127\.0\.0\.1:[0-9]+' | head -1 | cut -d: -f2 || true)
+            [ -n "$port" ] && break
+            sleep 1
+          done
+          if [ -z "$port" ]; then
+            echo "Could not find the sidecar's listening port."
+            cat "$test_home/app.log" || true
+            exit 1
+          fi
+
+          status=$(curl -sS -m 5 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/")
+          if [ "$status" != "200" ]; then
+            echo "The packaged app's page returned $status instead of 200."
+            exit 1
+          fi
+          echo "Packaged app launched; local server on 127.0.0.1:$port served the app page offline."
+
+          kill -TERM "$app_pid"
+          sleep 3
+          if pgrep -f "planner-server.*main\.js" > /dev/null; then
+            echo "The local server sidecar was still running after the app was asked to close."
+            exit 1
+          fi
+          echo "Closing the app stopped its local server sidecar (no orphaned process)."
+
+      - name: Launch check (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # As on Linux/macOS: the raw target/release/financial-planner-desktop.exe
+          # has no resources or sidecar next to it (those only land in the NSIS
+          # bundle output). Install it silently, like a user's installer would.
+          $installer = Get-ChildItem -Path "src-tauri/target/release/bundle/nsis" -Filter *.exe | Select-Object -First 1
+          Start-Process -FilePath $installer.FullName -ArgumentList "/S" -Wait
+
+          $exe = Get-ChildItem -Path "$env:LOCALAPPDATA","$env:ProgramFiles","${env:ProgramFiles(x86)}" `
+            -Recurse -Filter "financial-planner-desktop.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $exe) {
+            Write-Error "Could not find the installed app executable after running the NSIS installer silently."
+            exit 1
+          }
+
+          $testHome = Join-Path $env:RUNNER_TEMP "planner-launch-test"
+          New-Item -ItemType Directory -Force -Path $testHome | Out-Null
+          $env:APPDATA = Join-Path $testHome "AppData"
+          New-Item -ItemType Directory -Force -Path $env:APPDATA | Out-Null
+
+          $proc = Start-Process -FilePath $exe.FullName -PassThru
+
+          # A first cold launch of a freshly built webview app is measurably slower
+          # on a CI runner than on a real machine (seen directly on this run: the
+          # same check timed out at 30s here and on Linux); 90s gives real headroom
+          # without masking an actual hang.
+          $sidecar = $null
+          for ($i = 0; $i -lt 90; $i++) {
+            $sidecar = Get-CimInstance Win32_Process -Filter "Name = 'planner-server.exe'" -ErrorAction SilentlyContinue |
+              Where-Object { $_.CommandLine -like '*main.js*' } | Select-Object -First 1
+            if ($sidecar) { break }
+            Start-Sleep -Seconds 1
+          }
+          if (-not $sidecar) {
+            Write-Error "The packaged app did not start its local server sidecar within 90s."
+            Get-Process -Name "financial-planner-desktop","planner-server" -ErrorAction SilentlyContinue | Format-Table -AutoSize
+            exit 1
+          }
+          Write-Host "Sidecar found after ${i}s."
+
+          $conn = $null
+          for ($i = 0; $i -lt 30; $i++) {
+            $conn = Get-NetTCPConnection -OwningProcess $sidecar.ProcessId -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($conn) { break }
+            Start-Sleep -Seconds 1
+          }
+          if (-not $conn) {
+            # Say why, instead of only that it failed: is the sidecar still alive, what was it
+            # started with, what is listening, and does the installed server run when started by hand.
+            Write-Host "---- diagnostics ----"
+            Write-Host "Sidecar pid $($sidecar.ProcessId) command line: $($sidecar.CommandLine)"
+            Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -in 'planner-server.exe','financial-planner-desktop.exe' } |
+              Select-Object ProcessId, Name, CommandLine | Format-List
+            Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+              Select-Object LocalAddress, LocalPort, OwningProcess | Sort-Object OwningProcess | Format-Table -AutoSize
+            $installDir = Split-Path $exe.FullName
+            Get-ChildItem -Path $installDir -Recurse -Depth 3 -ErrorAction SilentlyContinue | Select-Object -First 60 FullName | Format-Table -AutoSize
+            $node = Join-Path $installDir "planner-server.exe"
+            $entry = Get-ChildItem -Path $installDir -Recurse -Filter "main.js" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ((Test-Path $node) -and $entry) {
+              foreach ($spelling in @($entry.FullName, "\\?\$($entry.FullName)")) {
+                Write-Host "Running the installed server by hand with entry: $spelling"
+                $out = Join-Path $env:RUNNER_TEMP "manual-out.txt"; $err = Join-Path $env:RUNNER_TEMP "manual-err.txt"
+                $manual = Start-Process -FilePath $node -ArgumentList "`"$spelling`"","--port","0","--household-data" -PassThru -NoNewWindow -RedirectStandardOutput $out -RedirectStandardError $err
+                Start-Sleep -Seconds 6
+                Write-Host "  still running: $(-not $manual.HasExited)"
+                Write-Host "  stdout: $(Get-Content $out -Raw -ErrorAction SilentlyContinue)"
+                Write-Host "  stderr: $(Get-Content $err -Raw -ErrorAction SilentlyContinue)"
+                Stop-Process -Id $manual.Id -Force -ErrorAction SilentlyContinue
+              }
+            }
+            Write-Error "Could not find the sidecar's listening port."
+            exit 1
+          }
+
+          $response = Invoke-WebRequest -Uri "http://127.0.0.1:$($conn.LocalPort)/" -UseBasicParsing
+          if ($response.StatusCode -ne 200) {
+            Write-Error "The packaged app's page returned $($response.StatusCode) instead of 200."
+            exit 1
+          }
+          Write-Host "Packaged app launched; local server on 127.0.0.1:$($conn.LocalPort) served the app page offline."
+
+          # Force-stopping the process tree here does not exercise the window's
+          # close-box handler (there is no window manager close event to send
+          # non-interactively), so this only confirms cleanup, not the shutdown path.
+          Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+          Stop-Process -Id $sidecar.ProcessId -Force -ErrorAction SilentlyContinue
+
+      # Staged under release names (household-planner_<version>_<platform>...) so
+      # scripts/publish-release.mjs can publish them as they are. The `.sig` files are the
+      # updater signatures; macOS updates use the .app.tar.gz, Linux the AppImage, Windows
+      # the setup .exe.
+      - name: Stage artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(node -p "require('./package.json').version")
+          sha=$(git rev-parse --short=10 HEAD)
+          out=artifacts-staging
+          mkdir -p "$out"
+          copy() { # copy <glob> <name> [required]
+            local f; f=$(ls $1 2>/dev/null | head -1 || true)
+            if [ -n "$f" ]; then cp "$f" "$out/$2"; elif [ "${3:-}" = "required" ]; then echo "Missing $1"; exit 1; fi
+          }
+          b=src-tauri/target/release/bundle
+          case "${{ runner.os }}" in
+            Linux)
+              copy "$b/deb/*.deb" "household-planner_${version}_linux-x86_64.deb" required
+              copy "$b/appimage/*.AppImage" "household-planner_${version}_linux-x86_64.AppImage" required
+              copy "$b/appimage/*.AppImage.sig" "household-planner_${version}_linux-x86_64.AppImage.sig"
+              ;;
+            Windows)
+              copy "$b/nsis/*-setup.exe" "household-planner_${version}_windows-x86_64-setup.exe" required
+              copy "$b/nsis/*-setup.exe.sig" "household-planner_${version}_windows-x86_64-setup.exe.sig"
+              ;;
+            macOS)
+              copy "$b/dmg/*.dmg" "household-planner_${version}_darwin-aarch64.dmg" required
+              copy "$b/macos/*.app.tar.gz" "household-planner_${version}_darwin-aarch64.app.tar.gz"
+              copy "$b/macos/*.app.tar.gz.sig" "household-planner_${version}_darwin-aarch64.app.tar.gz.sig"
+              ;;
+          esac
+          echo "version=$version commit=$sha" > "$out/BUILD-${{ matrix.name }}.txt"
+          ls -la "$out"
+
+      - name: Keep the build in the draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ needs.plan.outputs.draft }}" artifacts-staging/* --clobber --repo "$GITHUB_REPOSITORY"

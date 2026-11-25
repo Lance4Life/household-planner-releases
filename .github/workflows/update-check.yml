@@ -1,0 +1,95 @@
+name: Update check
+
+# Proves that an installed copy of the desktop app can update itself through the in-app
+# button without losing any data: builds an "old" and a "new" Linux AppImage signed with a
+# throwaway key, serves the update from the runner itself, and runs scripts/update-e2e.mjs.
+# Runs on demand and whenever the packaging branches are pushed.
+#
+# Like package.yml, this file also runs in the public Lance4Life/household-planner-releases repo
+# (free minutes), checking out the private source with the read-only SOURCE_DEPLOY_KEY:
+#   gh workflow run update-check.yml --repo Lance4Life/household-planner-releases -f source_ref=<branch or commit>
+on:
+  push:
+    branches: ['packaging/**']
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Branch or commit of Lance4Life/financial-planner to test (used in the public releases repo)
+        default: main
+
+env:
+  IN_SOURCE_REPO: ${{ github.repository == 'Lance4Life/financial-planner' }}
+
+permissions:
+  contents: read
+
+jobs:
+  update:
+    name: linux update, end to end
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: Lance4Life/financial-planner
+          ref: ${{ github.repository == 'Lance4Life/financial-planner' && github.sha || inputs.source_ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: ${{ env.IN_SOURCE_REPO == 'true' && 'npm' || '' }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        if: env.IN_SOURCE_REPO == 'true'
+        with:
+          workspaces: src-tauri -> target
+      - name: Linux build and test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev libsoup-3.0-dev \
+            libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev \
+            patchelf file xvfb libfuse2t64 iproute2
+      - run: npm ci
+      - run: npm run build
+      - run: npm run package:prepare-sidecar
+
+      - name: A throwaway signing key and test configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run --silent tauri -- signer generate --ci -p update-test -w "$RUNNER_TEMP/test.key"
+          pub=$(cat "$RUNNER_TEMP/test.key.pub")
+          for v in 0.0.1 0.0.2; do
+            cat > "$RUNNER_TEMP/test-$v.json" <<JSON
+          {
+            "version": "$v",
+            "bundle": { "createUpdaterArtifacts": true },
+            "plugins": { "updater": { "pubkey": "$pub", "endpoints": ["http://127.0.0.1:8765/latest.json"], "dangerousInsecureTransportProtocol": true } }
+          }
+          JSON
+          done
+
+      - name: Build the old and the new version
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: update-test
+        run: |
+          set -euo pipefail
+          export TAURI_SIGNING_PRIVATE_KEY="$(cat "$RUNNER_TEMP/test.key")"
+          b=src-tauri/target/release/bundle/appimage
+          npm run tauri -- build --bundles appimage --config "$RUNNER_TEMP/test-0.0.1.json"
+          cp "$(ls $b/*.AppImage | head -1)" "$RUNNER_TEMP/old.AppImage"
+          rm -f $b/*.AppImage $b/*.sig
+          npm run tauri -- build --bundles appimage --config "$RUNNER_TEMP/test-0.0.2.json"
+          mkdir -p "$RUNNER_TEMP/serve"
+          cp $b/*.AppImage $b/*.AppImage.sig "$RUNNER_TEMP/serve/"
+          ls -la "$RUNNER_TEMP" "$RUNNER_TEMP/serve"
+
+      - name: Update the old app in place and check the data
+        shell: bash
+        run: |
+          set -euo pipefail
+          Xvfb :99 -screen 0 1280x1024x24 > /dev/null 2>&1 &
+          export DISPLAY=:99
+          sleep 1
+          timeout 600 node scripts/update-e2e.mjs --old "$RUNNER_TEMP/old.AppImage" --serve "$RUNNER_TEMP/serve" --new-version 0.0.2
